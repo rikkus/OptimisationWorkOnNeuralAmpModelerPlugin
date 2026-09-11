@@ -1,105 +1,169 @@
-# NeuralAmpModelerPlugin — Apple Silicon optimization fork
+# NeuralAmpModelerPlugin — ARM optimization fork
 
-This is a fork of `sdatkinson/NeuralAmpModelerPlugin` whose purpose is a
-performance optimization of NAM's WaveNet inference on Apple Silicon (and other
-ARMv8+ CPUs). The optimization work lives on the branch
-**`optimise-for-apple-silicon`** in both this repo and the `NeuralAmpModelerCore`
-submodule; the default `main` branch does **not** contain it.
+This is a fork of `sdatkinson/NeuralAmpModelerPlugin` whose purpose is getting
+faster WaveNet inference into the plugin on ARM: Apple Silicon, AArch64
+generally, and 32-bit ARMv7. The default `main` branch does **not** contain the
+work; it lives on the branches below.
 
 ## Where the work is
 
-Almost all of it is in the `NeuralAmpModelerCore` submodule (a fork at
-`rikkus/OptimisationWorkOnNeuralAmpModelerCore`; this repo's `.gitmodules`
-points the submodule there):
+The kernels are in NeuralAmpModelerCore, proposed upstream as
+[sdatkinson/NeuralAmpModelerCore#313](https://github.com/sdatkinson/NeuralAmpModelerCore/pull/313)
+from the Core fork (`rikkus/OptimisationWorkOnNeuralAmpModelerCore`, branch
+`apple-silicon-a2-planar`). This repo only wires them into the plugin builds,
+proposed as
+[sdatkinson/NeuralAmpModelerPlugin#679](https://github.com/sdatkinson/NeuralAmpModelerPlugin/pull/679).
 
-- **`NeuralAmpModelerCore/NAM/wavenet/fused.{h,cpp}`** — a fused, register-tiled
-  NEON WaveNet engine for AArch64. Standard-shape models (A1 standard/lite
-  family, A2 standard, and similar: mono in, `bottleneck == channels`, channels
-  a multiple of 4 ≤ 32, no gating/FiLM/grouping) are routed here instead of the
-  generic Eigen path. Everything else falls through unchanged.
-- **`NeuralAmpModelerCore/docs/fused-engine.md`** — **read this first.** The
-  authoritative design doc: the profile that motivated it, the kernel design,
-  the measured numbers, and the alternatives that were measured and rejected
-  (Accelerate/AMX, fp16/bf16, BNNS/Metal/ANE, multithreading).
-- **`NeuralAmpModelerCore/tools/test/test_fused.cpp`** — numerical parity tests
-  (fused vs generic within 5e-5) across shapes, activations, and block sizes,
-  plus detector negatives and a zero-allocation real-time-safety test. Wired
-  into `run_tests`.
-- Dispatch is in `NeuralAmpModelerCore/NAM/wavenet/model.cpp`
-  (`wavenet::create_config`): order is slimmable → fused → a2_fast → generic.
-- **`NeuralAmpModelerCore/benchmark_reports/`** — before/after Apple M2 reports
-  (`..._apple_m2_baseline.txt` = generic; `..._192034.txt` = fused) and
-  `run_benchmarks.sh`.
+In the Core submodule:
 
-Plugin-side integration in this repo:
+- **`NAM/wavenet/a2_planar.{h,cpp}`** — planar NEON kernels for the A2 fast
+  path (A2 nano, 3 channels; A2 standard, 8 channels). **Read the header comment
+  in `a2_planar.h` first**: it is the authoritative design note — the gate, the
+  per-architecture tile widths and conv-loop shapes, the measured numbers, and
+  the ARMv7 caveats.
+- Selection happens in `A2FastConfig::create` (`NAM/wavenet/a2_fast.cpp`), which
+  prefers the planar model where one exists and otherwise returns the reference
+  `A2FastModel` (`create_a2_fast_reference_model`).
+- **`tools/test/test_a2_planar.cpp`** — `memcmp` bit-identity against `a2_fast`
+  at 14 block sizes, plus a check that the dispatcher really routes to planar.
+  Wired into `run_tests`.
+- **`tools/bench_a2_planar.cpp`** — renders a whole signal through both engines,
+  compares bit for bit, and reports speed only if they matched.
 
-- `NeuralAmpModeler/config/NeuralAmpModeler-{mac,ios}.xcconfig` and
-  `NeuralAmpModeler-win.props` define `NAM_ENABLE_FUSED` (and, for iOS which was
-  previously missing them, `NAM_ENABLE_A2_FAST` too).
-- The macOS and iOS Xcode projects add `wavenet/fused.cpp` (and, for iOS,
-  `wavenet/a2_fast.cpp`) to the source lists.
+Plugin-side integration in this repo (PR #679):
 
-The fused engine is gated by the `NAM_ENABLE_FUSED` compile definition
-(CMake option `NAM_ENABLE_FUSED`, default ON); it is a no-op stub on non-ARM
-builds, and the shape detector declines every model on those targets.
+- The macOS, iOS and Windows projects register `wavenet/a2_planar.{cpp,h}`
+  alongside `wavenet/a2_fast.{cpp,h}`. There is **no new build flag**:
+  `a2_planar.h` gates itself on `NAM_ENABLE_A2_FAST` plus the target being
+  AArch64, or 32-bit ARM with NEON and FMA. Everywhere else the translation unit
+  compiles to no symbols (the x86_64 slice of a universal macOS binary has none).
+- iOS additionally gets `NAM_ENABLE_A2_FAST` defined and `a2_fast.{cpp,h}`
+  registered, which it didn't have before.
+- All three platforms also register Core files the old submodule pin predated
+  (`linear`, `nam_file`, `sequential`, and some headers); without them the link
+  fails on `nam::validate_nam_file`.
 
-## Results (Apple M2, 48 kHz, buffer 64)
+## The submodule pin
 
-`wavenet_a1_standard` ~86 ms → ~39 ms per 2 s of audio (23× → 51× real-time,
-**~2.2×**); ~2.7× at buffer 16; A2 standard ~2×. Fused-vs-generic output agrees
-to −127 dB RMS on real rendered models. See `docs/fused-engine.md` for the full
-table and methodology.
+`.gitmodules` points `NeuralAmpModelerCore` at **upstream**
+(`sdatkinson/NeuralAmpModelerCore`) — a PR here must not change where the
+submodule comes from. But until Core PR #313 merges, the pinned commit exists
+only on the Core fork, so a plain `git submodule update --init` will fail to
+fetch it. Fetch it by SHA from the fork instead:
 
-## Building and benchmarking the core (fast iteration path)
+```sh
+SHA=$(git ls-tree HEAD NeuralAmpModelerCore | awk '{print $3}')
+git -C NeuralAmpModelerCore fetch https://github.com/rikkus/OptimisationWorkOnNeuralAmpModelerCore.git "$SHA"
+git -C NeuralAmpModelerCore checkout "$SHA"
+git -C NeuralAmpModelerCore submodule update --init --recursive
+```
+
+Once #313 merges, repoint nothing — just bump the pin to an upstream commit.
+
+## Results
+
+Bit-identical to `a2_fast` in every case (not "within a tolerance"). At
+64-frame blocks, A2 standard / A2 nano, against `a2_fast`:
+
+| Part | A2 standard | A2 nano |
+|---|---:|---:|
+| Apple M2 | 2.46× | 2.02× |
+| Cortex-A76 (Raspberry Pi 500) | 2.15× | 3.08× |
+| Cortex-A17 (RK3288, 1416 MHz) | 1.35× | 1.55× |
+
+PR #313's description has the methodology and more figures. Results are tracked
+over time in Bencher from the benchmark harness at `rikkus/NAMBench`.
+
+## Building and testing the core (fast iteration path)
 
 The core library builds standalone without the (heavy) iPlug2 submodule:
 
 ```sh
-# From this repo root. Nested submodules must be present or CMake fails on
-# AudioDSPTools/dsp/wav.cpp:
+# Nested submodules must be present or CMake fails on AudioDSPTools/dsp/wav.cpp:
 git -C NeuralAmpModelerCore submodule update --init --recursive
 
 cd NeuralAmpModelerCore
-mkdir -p build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release
-cmake --build . --target benchmodel benchmodel_bufsize bench_a2_fast run_tests render -j$(sysctl -n hw.ncpu)
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --target run_tests bench_a2_planar -j"$(sysctl -n hw.ncpu)"
 
-./tools/run_tests                                    # correctness (incl. fused parity)
-./tools/benchmodel example_models/wavenet_a1_standard.nam   # 2s @ 48k, buffer 64
-../benchmark_reports/run_benchmarks.sh               # full timestamped report
+./build/tools/run_tests
+./build/tools/bench_a2_planar --submodel widest    example_models/A2.nam
+./build/tools/bench_a2_planar --submodel narrowest example_models/A2.nam
 ```
 
-`benchmodel` takes a `--seconds N` flag (added for longer profiling runs;
-`sample <pid> 10` gives good flat profiles). To A/B against the generic path,
-configure a second build dir with `-DNAM_ENABLE_FUSED=OFF` and diff `render`
-output WAVs (they are float32 — parse the RIFF manually; Python's `wave` module
-rejects format 3).
+`-DNAM_DISABLE_A2_PLANAR` turns the kernels off, which makes an A/B against the
+reference a one-flag change. Build at `-O3`, never `-ffast-math`/`-Ofast`: it
+lets the compiler contract across statements, which is exactly the freedom the
+bit-identity claim depends on not being taken — in either engine.
 
-## Key design decisions (don't relitigate without new data)
+## Building and testing the plugin
 
-- **Hand NEON, not Accelerate/AMX**: `cblas_sgemm` only ties the register-tiled
-  NEON kernel at these tiny matrix sizes (~16×16 per tap); the AMX advantage
-  needs much larger matrices. Not worth the dependency or unclear RT behavior.
-- **`vdivq_f32` for the fast-tanh rational**, not reciprocal + Newton: the
-  M-series FP divider is a separate unit, so division overlaps the FMAs and
-  measured faster (0.26 vs 0.39 ns/float) — and it is exact.
-- **fp16 gives no compute win** on Apple cores (`FMLAL` is the same 4
-  MACs/instruction as fp32 FMA; we are compute-bound). Full fp16 accumulation
-  is an audio-quality risk over the long conv sums. **SME (M4+)** is the real
-  next lever but needs M4 hardware to develop/validate.
-- Activations use NEON kernels only for known implementations (fast-tanh, ReLU,
-  LeakyReLU, Hardtanh, Softsign); anything else calls the exact same
-  `Activation` object the generic path would, so semantics (including
-  `enable_fast_tanh()` and LUTs) never diverge.
+Follow `CONTRIBUTING.md`'s testing checklist. The CI recipe
+(`.github/workflows/build-native.yml`) fetches the SDKs first:
+
+```sh
+(cd iPlug2/Dependencies/IPlug && ./download-iplug-sdks.sh)
+(cd iPlug2/Dependencies && ./download-prebuilt-libs.sh)
+```
+
+Then build individual targets rather than `All` (the AAX SDK isn't public, so
+`All` fails without it):
+
+```sh
+cd NeuralAmpModeler
+xcodebuild -project ./projects/NeuralAmpModeler-macOS.xcodeproj \
+  -xcconfig ./config/NeuralAmpModeler-mac.xcconfig DEMO_VERSION=0 \
+  -target VST3 -configuration Release        # likewise APP, AU
+```
+
+Builds install to `~/Applications` and `~/Library/Audio/Plug-Ins/`,
+**overwriting any NAM already installed there**.
+
+- The project targets macOS 10.15. Current beta Xcode only accepts 12.0 and
+  up, so locally raise `MACOSX_DEPLOYMENT_TARGET` in `common-mac.xcconfig` and
+  the macOS project — and revert it before committing (the build also rewrites
+  `LSMinimumSystemVersion` in `NeuralAmpModeler/resources/*-Info.plist`).
+- **VST3:** Steinberg's command-line `validator` (build it from the full
+  `steinbergmedia/vst3sdk`; iPlug2's copy of the SDK omits the hosting samples)
+  runs the same suite as the VST3PluginTestHost's unit-test tab:
+  `validator -e ~/Library/Audio/Plug-Ins/VST3/NeuralAmpModeler.vst3`.
+- **AU:** `auval -v aufx 1YEo SDAa`.
+- The Slim knob is hidden until a slimmable model is loaded; then an icon
+  appears right of the model box. Slim < 0.5 selects A2 nano, ≥ 0.5 A2 standard
+  — test both, since they are separate kernels.
+
+## Known issues
+
+- `test_a2_planar`'s synthetic `channels=3, block=1` case fails bit-identity on
+  a Cortex-A76 and a Cortex-A17 (not on an M2). It is pre-existing — it fails
+  identically on the pre-rebase code — and real-model renders through
+  `bench_a2_planar` on the A76 are bit-identical at both 64- and 1-frame blocks.
+  Don't chase it as a regression; it is undiagnosed.
+- ARMv7 bit-identity rests on the host having FPSCR.FZ set (AArch32 NEON is
+  always flush-to-zero; VFP scalar honours the bit). See `a2_planar.h`.
+- The old-style (directory) model item in `CONTRIBUTING.md` can't be tested:
+  the model picker only accepts `.nam`, and Core's `get_dsp_legacy` is declared
+  but not defined (upstream `main` too).
+- Code style: use the clang-format version Core's CI names (19). Newer versions
+  reformat untouched upstream files; never commit a `format.bash` run
+  wholesale.
 
 ## Fork / branch layout
 
 - This repo: `origin` = `rikkus/OptimisationWorkOnNeuralAmpModelerPlugin`,
-  upstream = `sdatkinson/NeuralAmpModelerPlugin`. Work on
-  `optimise-for-apple-silicon`.
-- Core submodule fork: `rikkus/OptimisationWorkOnNeuralAmpModelerCore`, same
-  branch name. The submodule commit referenced by this branch
-  (`09d46b0`, the fused engine) lives on that fork's `optimise-for-apple-silicon`.
+  upstream = `sdatkinson/NeuralAmpModelerPlugin`.
+  - `fused-optimisation` — **the head of PR #679**. The name is historical: it
+    once carried an earlier engine ("fused") that has since been retired in
+    favour of the planar kernels. Left unrenamed so the open PR isn't disturbed.
+  - `ir-optimisation` — parked IR work (see below).
+- Core fork: `rikkus/OptimisationWorkOnNeuralAmpModelerCore`.
+  - `apple-silicon-a2-planar` — the head of Core PR #313, ARMv7 work included.
+  - `ir-optimisation` — test/bench harness for the IR work, built on the
+    retired engine's commit.
+- AudioDSPTools fork: `rikkus/AudioDSPTools`, branch `ir-optimisation` —
+  zero-latency partitioned-FFT convolution for long cab IRs. Never proposed
+  upstream, and upstream has nothing equivalent; the Plugin and Core
+  `ir-optimisation` branches only wire it up.
 - These forks keep the `OptimisationWorkOn…` name because GitHub allows only one
   fork of a given upstream per account; renaming (with redirects) is the way to
   get a shorter name if ever wanted.
