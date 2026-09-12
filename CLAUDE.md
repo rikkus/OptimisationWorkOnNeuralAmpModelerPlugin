@@ -134,11 +134,16 @@ Builds install to `~/Applications` and `~/Library/Audio/Plug-Ins/`,
 
 ## Known issues
 
-- `test_a2_planar`'s synthetic `channels=3, block=1` case fails bit-identity on
-  a Cortex-A76 and a Cortex-A17 (not on an M2). It is pre-existing — it fails
-  identically on the pre-rebase code — and real-model renders through
-  `bench_a2_planar` on the A76 are bit-identical at both 64- and 1-frame blocks.
-  Don't chase it as a regression; it is undiagnosed.
+- **(Fixed, but worth knowing.)** `test_a2_planar` used to fail at
+  `channels=3, block=1` on GCC targets (a Cortex-A76, a Cortex-A17) while
+  passing on an M2. Nothing was wrong with the kernels: upstream compiles the
+  whole `run_tests` target at `-O0` for its allocation tracking, and GCC only
+  contracts `a * b + c` into an FMA in its optimisers — so the *reference*
+  `A2FastModel<3>` stopped being the code the bit-identity claim is about.
+  Clang contracts during codegen, which is why Apple Silicon hid it. Core PR
+  #313 now builds the two A2 kernels as an `-O3` object library for that target
+  only. If a parity test ever fails on one machine and not another, suspect the
+  optimisation level of the reference before the kernel.
 - ARMv7 bit-identity rests on the host having FPSCR.FZ set (AArch32 NEON is
   always flush-to-zero; VFP scalar honours the bit). See `a2_planar.h`.
 - The old-style (directory) model item in `CONTRIBUTING.md` can't be tested:
